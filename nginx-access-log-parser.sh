@@ -9,9 +9,11 @@ set -eu
 # Byte-based sort and awk. Faster and safe for any input.
 export LC_ALL=C
 
-# nginx default "combined" format. Export NGINX_LOG_FORMAT to override it.
+# nginx is often in /usr/sbin, which is not in the PATH of normal users.
+PATH="$PATH:/usr/sbin:/usr/local/sbin"
+
+# nginx default "combined" format.
 DEFAULT_LOG_FORMAT='$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
-NGINX_LOG_FORMAT="${NGINX_LOG_FORMAT:-$DEFAULT_LOG_FORMAT}"
 
 LOG_FILE="${NGINX_ACCESS_LOG:-/var/log/nginx/access.log}"
 SINCE="30m"
@@ -31,8 +33,13 @@ Options:
                      Default: /var/log/nginx/access.log
   -h, --help         Show this help.
 
+Log format:
+  The script reads the log_format of the access log from the nginx config
+  ("nginx -T"). If this fails, it uses NGINX_LOG_FORMAT or, if that is not
+  set, the nginx "combined" format.
+
 Environment:
-  NGINX_LOG_FORMAT   log_format of the access log. Default: nginx "combined".
+  NGINX_LOG_FORMAT   Log format to use when the nginx config is not readable.
   NGINX_ACCESS_LOG   Default value of --file.
 EOF
 }
@@ -81,10 +88,76 @@ read_logs() {
   done
 }
 
-# Parse log lines with NGINX_LOG_FORMAT. Print one tab-separated row per request:
+# Read the log_format of LOG_FILE from the nginx config ("nginx -T").
+# On success, set FORMAT_NAME and FORMAT_TEXT. On failure, set DETECT_ERROR and return 1.
+detect_log_format() {
+  local config file names
+
+  if ! command -v nginx > /dev/null; then
+    DETECT_ERROR="nginx command not found"
+    return 1
+  fi
+
+  if ! config=$(nginx -T 2>/dev/null); then
+    DETECT_ERROR="\"nginx -T\" failed, try sudo"
+    return 1
+  fi
+
+  # The config has absolute paths.
+  file=$(realpath -s "$LOG_FILE")
+
+  # Format names of the access_log lines for this file. No name means "combined".
+  names=$(awk -v file="$file" '
+    $1 == "access_log" && ($2 == file || $2 == file ";") {
+      name = $3
+      sub(/;$/, "", name)
+      if (name == "") name = "combined"
+      print name
+    }' <<< "$config" | sort -u)
+
+  if [ -z "$names" ]; then
+    DETECT_ERROR="no access_log for $file"
+    return 1
+  fi
+
+  if [ "$(wc -l <<< "$names")" -gt 1 ]; then
+    DETECT_ERROR="$file has more than one log_format: $(paste -sd ' ' <<< "$names")"
+    return 1
+  fi
+
+  FORMAT_NAME="$names"
+
+  # "combined" is built into nginx, so it is not in the config.
+  if [ "$FORMAT_NAME" = "combined" ]; then
+    FORMAT_TEXT="$DEFAULT_LOG_FORMAT"
+    return 0
+  fi
+
+  # Join the quoted strings of "log_format NAME", up to the ";" at the end.
+  FORMAT_TEXT=$(awk -v name="$FORMAT_NAME" '
+    $1 == "log_format" && $2 == name { found = 1 }
+    found && $1 ~ /^#/ { next }
+    found {
+      line = $0
+      # \047 is a single quote.
+      while (match(line, /\047[^\047]*\047/)) {
+        printf "%s", substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      sub(/#.*/, "", line)
+      if (line ~ /;/) exit
+    }' <<< "$config")
+
+  if [ -z "$FORMAT_TEXT" ]; then
+    DETECT_ERROR="cannot read log_format $FORMAT_NAME"
+    return 1
+  fi
+}
+
+# Parse log lines with LOG_FORMAT. Print one tab-separated row per request:
 #   1 ip | 2 status | 3 path | 4 domain | 5 user agent | 6 referer | 7 bytes | 8 upstream time
 parse_logs() {
-  awk -v log_format="$NGINX_LOG_FORMAT" -v since="$SINCE_STAMP" '
+  awk -v log_format="$LOG_FORMAT" -v since="$SINCE_STAMP" '
     # Split the format into tokens: variables ($status) and the text between them.
     function parse_format(format,    count) {
       count = 0
@@ -200,7 +273,7 @@ parse_logs() {
 
     END {
       if (unparsed > 0) {
-        print "warning: " unparsed " lines do not match NGINX_LOG_FORMAT" > "/dev/stderr"
+        print "warning: " unparsed " lines do not match the log format" > "/dev/stderr"
       }
     }
   '
@@ -263,6 +336,7 @@ print_summary() {
     printf "%-14s %s\n" "$label" "$file"
     label=""
   done
+  echo "Log format:    $FORMAT_SOURCE"
   echo "Since:         $SINCE_HUMAN"
   awk -F '\t' '
     {
@@ -315,24 +389,40 @@ if ! [[ "$TOP" =~ ^[1-9][0-9]*$ ]]; then
   die "--top must be a positive number"
 fi
 
-# The parser finds the end of a variable by the text after it.
-if [[ "$NGINX_LOG_FORMAT" =~ \$[a-zA-Z0-9_]+\$ ]]; then
-  die "NGINX_LOG_FORMAT: each variable must be followed by text, not by another variable"
-fi
-
-if [[ "$NGINX_LOG_FORMAT" != *'$time_local'* && "$NGINX_LOG_FORMAT" != *'$time_iso8601'* ]]; then
-  echo "warning: NGINX_LOG_FORMAT has no \$time_local or \$time_iso8601, --since only filters files" >&2
+if [ ! -f "$LOG_FILE" ]; then
+  die "cannot access log file: $LOG_FILE"
 fi
 
 SINCE_EPOCH=$(since_to_epoch "$SINCE" 2>/dev/null) || die "invalid --since value: $SINCE"
 SINCE_STAMP=$(date -d "@$SINCE_EPOCH" +%Y%m%d%H%M%S)
 SINCE_HUMAN=$(date -d "@$SINCE_EPOCH" '+%Y-%m-%d %H:%M:%S %Z')
 
-# --- Log files ---
+# --- Log format ---
 
-if [ ! -f "$LOG_FILE" ]; then
-  die "cannot access log file: $LOG_FILE"
+# Order: nginx config, then NGINX_LOG_FORMAT, then the default "combined" format.
+if detect_log_format; then
+  LOG_FORMAT="$FORMAT_TEXT"
+  FORMAT_SOURCE="log_format $FORMAT_NAME (nginx config)"
+elif [ -n "${NGINX_LOG_FORMAT:-}" ]; then
+  LOG_FORMAT="$NGINX_LOG_FORMAT"
+  FORMAT_SOURCE="NGINX_LOG_FORMAT variable"
+  echo "notice: cannot read the log format from the nginx config ($DETECT_ERROR). Using the NGINX_LOG_FORMAT variable." >&2
+else
+  LOG_FORMAT="$DEFAULT_LOG_FORMAT"
+  FORMAT_SOURCE="default combined format"
+  echo "notice: cannot read the log format from the nginx config ($DETECT_ERROR). Using the default combined format. Export NGINX_LOG_FORMAT to change it." >&2
 fi
+
+# The parser finds the end of a variable by the text after it.
+if [[ "$LOG_FORMAT" =~ \$[a-zA-Z0-9_]+\$ ]]; then
+  die "log format: each variable must be followed by text, not by another variable"
+fi
+
+if [[ "$LOG_FORMAT" != *'$time_local'* && "$LOG_FORMAT" != *'$time_iso8601'* ]]; then
+  echo "warning: the log format has no \$time_local or \$time_iso8601, --since only filters files" >&2
+fi
+
+# --- Log files ---
 
 # Current log plus rotated logs. Skip files not modified since the start of the window.
 LOG_FILES=()
@@ -370,9 +460,9 @@ print_summary
 print_section "Top IPs" "$(top_column 1)"
 print_section "Top user agents" "$(top_column 5)"
 print_section "Top paths" "$(top_column 3)"
-print_section "Top domains" "$(top_column 4)" "no data: add \$host to NGINX_LOG_FORMAT"
+print_section "Top domains" "$(top_column 4)" "no data: add \$host to the log format"
 print_section "Top status codes" "$(top_column 2)"
-print_section "Top paths by upstream time" "$(slowest_paths)" "no data: add \$upstream_response_time to NGINX_LOG_FORMAT"
+print_section "Top paths by upstream time" "$(slowest_paths)" "no data: add \$upstream_response_time to the log format"
 print_section "Top 4xx paths" "$(top_error_paths 4)"
 print_section "Top 5xx paths" "$(top_error_paths 5)"
 print_section "Top referers" "$(top_column 6)"

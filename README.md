@@ -6,7 +6,7 @@ A bash script that summarizes nginx access logs. It reads the current log and th
 
 The script prints these sections:
 
-- Summary: log files, start time, requests, unique IPs, 4xx and 5xx rates, data sent
+- Summary: log files, log format, start time, requests, unique IPs, 4xx and 5xx rates, data sent
 - Top IPs
 - Top user agents
 - Top paths
@@ -26,6 +26,7 @@ Each list counts requests and shows the top N values. The paths do not include t
 - GNU coreutils
 - awk (gawk or mawk)
 - gzip
+- nginx (optional), to read the log format from the nginx configuration
 
 The script uses GNU `date -d` and `stat -c`. It does not run with the BSD versions of these tools (macOS).
 
@@ -65,7 +66,7 @@ nginx-access-log-parser.sh [options]
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `NGINX_LOG_FORMAT` | nginx `combined` format | The `log_format` of the access log. |
+| `NGINX_LOG_FORMAT` | none | Log format to use when the script cannot read it from the nginx configuration. See [Log format](#log-format). |
 | `NGINX_ACCESS_LOG` | `/var/log/nginx/access.log` | Default value of `--file`. |
 
 ### Examples
@@ -90,9 +91,9 @@ Show a different log from a fixed time:
 
 ### Permissions
 
-Often, only root and a log group can read the nginx logs. On Debian and Ubuntu, this group is `adm`.
+Often, only root and a log group can read the nginx logs. On Debian and Ubuntu, this group is `adm`. Also, `nginx -T` usually needs root. Thus, run the script with `sudo`.
 
-`sudo` removes environment variables by default. Use `sudo -E` to keep `NGINX_LOG_FORMAT`:
+`sudo` removes environment variables by default. If you use `NGINX_LOG_FORMAT`, use `sudo -E` to keep it:
 
 ```bash
 sudo -E ./nginx-access-log-parser.sh --since 1h
@@ -100,13 +101,44 @@ sudo -E ./nginx-access-log-parser.sh --since 1h
 
 ## Log format
 
-The script parses each line with the format in `NGINX_LOG_FORMAT`. The default value is the nginx `combined` format:
+The script gets the log format in this order:
+
+1. The `log_format` of the access log in the nginx configuration
+2. The `NGINX_LOG_FORMAT` environment variable
+3. The nginx `combined` format
+
+If the script cannot read the format from the nginx configuration, it prints a notice. The notice gives the reason and the format that the script uses:
+
+```
+notice: cannot read the log format from the nginx config ("nginx -T" failed, try sudo). Using the NGINX_LOG_FORMAT variable.
+```
+
+The "Log format" line of the summary shows the source of the format.
+
+### Format from the nginx configuration
+
+The script reads the full nginx configuration with `nginx -T`. Then it does these steps:
+
+1. It finds the `access_log` directive with the path of `--file`.
+2. It gets the format name from this directive. If the directive has no format name, nginx uses `combined`.
+3. It finds the `log_format` directive with this name and joins its quoted strings.
+
+The script cannot read the format in these cases:
+
+- The `nginx` command is not available, or `nginx -T` fails. Usually, `nginx -T` needs root.
+- No `access_log` directive has the exact path of `--file`. For example, the path contains variables, or nginx runs on a different host.
+- The same file has more than one format.
+- The `log_format` strings are not in single quotes.
+
+### Domain and upstream time
+
+The `combined` format has no domain and no upstream time:
 
 ```
 $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
 ```
 
-The `combined` format has no domain and no upstream time. Thus, the "Top domains" and "Top paths by upstream time" sections show no data. To get these sections, add `$host` and `$upstream_response_time` to the nginx configuration:
+Thus, the "Top domains" and "Top paths by upstream time" sections show no data. To get these sections, add `$host` and `$upstream_response_time` to the nginx configuration:
 
 ```nginx
 log_format main '$remote_addr - $remote_user [$time_local] "$request" '
@@ -116,7 +148,11 @@ log_format main '$remote_addr - $remote_user [$time_local] "$request" '
 access_log /var/log/nginx/access.log main;
 ```
 
-Then set `NGINX_LOG_FORMAT` to the same format. Write it on one line, without the nginx quotes:
+Then reload nginx. The script reads the new format from the configuration. Lines from before the change do not match the new format. The script skips these lines and prints a warning.
+
+### NGINX_LOG_FORMAT
+
+If the script cannot read the nginx configuration, set `NGINX_LOG_FORMAT` to the format of the log. Write it on one line, without the nginx quotes:
 
 ```bash
 export NGINX_LOG_FORMAT='$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $host "$upstream_response_time"'
@@ -124,7 +160,12 @@ export NGINX_LOG_FORMAT='$remote_addr - $remote_user [$time_local] "$request" $s
 
 To keep the value for new shells, add this line to `~/.bashrc`.
 
+The format from the nginx configuration has priority. Thus, the script ignores `NGINX_LOG_FORMAT` when it can read the configuration.
+
 ### Format rules
+
+These rules apply to the format from all sources.
+
 
 - Put text between two variables. The parser finds the end of a variable at the text that follows it. Thus, `$remote_addr$status` is not valid.
 - A value must not contain the text that follows its variable. nginx writes `"` in a value as `\x22`. Thus, variables in quotes are safe.
@@ -171,6 +212,7 @@ The script compares the log time with `--since` in the local time zone of the sh
 $ ./nginx-access-log-parser.sh --top 3
 == Summary ==
 Log files:     /var/log/nginx/access.log
+Log format:    log_format main (nginx config)
 Since:         2026-10-11 14:34:45 EEST
 Requests:      400
 Unique IPs:    30
